@@ -16,6 +16,8 @@ use crate::chatwidget::ExternalEditorState;
 use crate::chatwidget::ThreadInputState;
 use crate::cwd_prompt::CwdPromptAction;
 use crate::diff_render::DiffSummary;
+use crate::exec_cell::ExecCell;
+use crate::exec_cell::ExecHistoryDetails;
 use crate::exec_command::strip_bash_lc_and_escape;
 use crate::external_editor;
 use crate::file_search::FileSearchManager;
@@ -117,6 +119,8 @@ mod pending_interactive_replay;
 use self::agent_navigation::AgentNavigationDirection;
 use self::agent_navigation::AgentNavigationState;
 use self::pending_interactive_replay::PendingInteractiveReplayState;
+
+const COMMAND_HISTORY_SELECTION_VIEW_ID: &str = "command-history-selection";
 
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
 const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
@@ -2251,6 +2255,34 @@ impl App {
                 ));
                 tui.frame_requester().schedule_frame();
             }
+            AppEvent::OpenCommandHistoryDetails { transcript_index } => {
+                let _ = tui.enter_alt_screen();
+                let renderables: Vec<Box<dyn Renderable>> = self
+                    .transcript_cells
+                    .get(transcript_index)
+                    .and_then(|cell| cell.as_any().downcast_ref::<ExecCell>())
+                    .and_then(|exec| exec.history_details())
+                    .map(|details| {
+                        vec![Box::new(
+                            Paragraph::new(details.detail_lines).wrap(Wrap { trim: false }),
+                        ) as Box<dyn Renderable>]
+                    })
+                    .unwrap_or_else(|| {
+                        vec![Box::new(
+                            Paragraph::new(vec![
+                                "Command history entry is no longer available."
+                                    .italic()
+                                    .into(),
+                            ])
+                            .wrap(Wrap { trim: false }),
+                        ) as Box<dyn Renderable>]
+                    });
+                self.overlay = Some(Overlay::new_static_with_renderables(
+                    renderables,
+                    "C O M M A N D   D E T A I L S".to_string(),
+                ));
+                tui.frame_requester().schedule_frame();
+            }
             AppEvent::ForkCurrentSession => {
                 self.session_telemetry.counter(
                     "codex.thread.fork",
@@ -3710,6 +3742,65 @@ impl App {
         tui.frame_requester().schedule_frame();
     }
 
+    fn command_history_entries(&self) -> Vec<(usize, ExecHistoryDetails)> {
+        self.transcript_cells
+            .iter()
+            .enumerate()
+            .rev()
+            .filter_map(|(idx, cell)| {
+                cell.as_any()
+                    .downcast_ref::<ExecCell>()
+                    .and_then(|exec| exec.history_details().map(|details| (idx, details)))
+            })
+            .collect()
+    }
+
+    fn open_command_history_picker(&mut self) {
+        let entries = self.command_history_entries();
+        if entries.is_empty() {
+            self.chat_widget.add_info_message(
+                "No completed Ran commands are available yet.".to_string(),
+                None,
+            );
+            return;
+        }
+
+        let items: Vec<SelectionItem> = entries
+            .into_iter()
+            .map(|(transcript_index, details)| SelectionItem {
+                name: details.command_display.clone(),
+                description: Some(details.status_label.clone()),
+                selected_description: Some(format!(
+                    "{} · latest: {}",
+                    details.status_label, details.result_preview
+                )),
+                search_value: Some(format!(
+                    "{} {} {}",
+                    details.command_display, details.status_label, details.result_preview
+                )),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::OpenCommandHistoryDetails { transcript_index });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            })
+            .collect();
+
+        self.chat_widget.show_selection_view(SelectionViewParams {
+            view_id: Some(COMMAND_HISTORY_SELECTION_VIEW_ID),
+            title: Some("Recent Commands".to_string()),
+            subtitle: Some(
+                "Choose a completed Ran command to inspect its full command and result."
+                    .to_string(),
+            ),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            is_searchable: true,
+            search_placeholder: Some("Type to filter commands".to_string()),
+            ..Default::default()
+        });
+    }
+
     async fn handle_key_event(&mut self, tui: &mut tui::Tui, key_event: KeyEvent) {
         // Some terminals, especially on macOS, encode Option+Left/Right as Option+b/f unless
         // enhanced keyboard reporting is available. We only treat those word-motion fallbacks as
@@ -3750,6 +3841,14 @@ impl App {
         }
 
         match key_event {
+            KeyEvent {
+                code: KeyCode::Char('o'),
+                modifiers: crossterm::event::KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                ..
+            } if self.overlay.is_none() && self.chat_widget.no_modal_or_popup_active() => {
+                self.open_command_history_picker();
+            }
             KeyEvent {
                 code: KeyCode::Char('p'),
                 modifiers: crossterm::event::KeyModifiers::CONTROL,

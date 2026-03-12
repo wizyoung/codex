@@ -30,6 +30,14 @@ pub(crate) const TOOL_CALL_MAX_LINES: usize = 5;
 const USER_SHELL_TOOL_CALL_MAX_LINES: usize = 50;
 const MAX_INTERACTION_PREVIEW_CHARS: usize = 80;
 
+#[derive(Clone, Debug)]
+pub(crate) struct ExecHistoryDetails {
+    pub(crate) command_display: String,
+    pub(crate) result_preview: String,
+    pub(crate) status_label: String,
+    pub(crate) detail_lines: Vec<Line<'static>>,
+}
+
 pub(crate) struct OutputLinesParams {
     pub(crate) line_limit: usize,
     pub(crate) only_err: bool,
@@ -250,6 +258,64 @@ impl HistoryCell for ExecCell {
 }
 
 impl ExecCell {
+    pub(crate) fn history_details(&self) -> Option<ExecHistoryDetails> {
+        let [call] = &self.calls.as_slice() else {
+            return None;
+        };
+        if self.is_exploring_cell() || call.is_unified_exec_interaction() {
+            return None;
+        }
+        let output = call.output.as_ref()?;
+        let command_display = strip_bash_lc_and_escape(&call.command);
+        let result_text = if !output.formatted_output.trim().is_empty() {
+            output.formatted_output.clone()
+        } else if !output.aggregated_output.trim().is_empty() {
+            output.aggregated_output.clone()
+        } else {
+            String::new()
+        };
+        let result_preview = result_text
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| "(no output)".to_string());
+        let duration = call
+            .duration
+            .map(format_duration)
+            .unwrap_or_else(|| "unknown".to_string());
+        let status_label = if output.exit_code == 0 {
+            format!("ok · {duration}")
+        } else {
+            format!("exit {} · {duration}", output.exit_code)
+        };
+
+        let mut detail_lines = vec![Line::from("Command".bold()), Line::from("")];
+        detail_lines.extend(highlight_bash_to_lines(&command_display));
+        detail_lines.push(Line::from(""));
+        detail_lines.push(Line::from("Result".bold()));
+        detail_lines.push(Line::from(""));
+        if result_text.is_empty() {
+            detail_lines.push(Line::from("(no output)".italic()));
+        } else {
+            detail_lines.extend(result_text.lines().map(ansi_escape_line));
+        }
+        detail_lines.push(Line::from(""));
+        let status_value = if output.exit_code == 0 {
+            status_label.clone().green()
+        } else {
+            status_label.clone().red()
+        };
+        detail_lines.push(Line::from(vec!["Status: ".bold(), status_value]));
+
+        Some(ExecHistoryDetails {
+            command_display,
+            result_preview,
+            status_label,
+            detail_lines,
+        })
+    }
+
     fn exploring_display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
         out.push(Line::from(vec![
@@ -785,6 +851,49 @@ mod tests {
             contains_ellipsis,
             "expected truncated output to include an ellipsis line"
         );
+    }
+
+    #[test]
+    fn history_details_include_full_command_and_result() {
+        let output = CommandOutput {
+            exit_code: 0,
+            aggregated_output: "line one\nline two\n".to_string(),
+            formatted_output: String::new(),
+        };
+        let call = ExecCall {
+            call_id: "call-id".to_string(),
+            command: vec![
+                "zsh".into(),
+                "-df".into(),
+                "-c".into(),
+                "echo line one; echo line two".into(),
+            ],
+            parsed: Vec::new(),
+            output: Some(output),
+            source: ExecCommandSource::Agent,
+            start_time: None,
+            duration: Some(std::time::Duration::from_millis(25)),
+            interaction_input: None,
+        };
+
+        let cell = ExecCell::new(call, false);
+        let details = cell.history_details().expect("expected history details");
+
+        assert!(
+            details
+                .command_display
+                .contains("echo line one; echo line two")
+        );
+        assert_eq!(details.result_preview, "line one");
+        let joined = details
+            .detail_lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("Command"));
+        assert!(joined.contains("Result"));
+        assert!(joined.contains("line two"));
     }
 
     #[test]

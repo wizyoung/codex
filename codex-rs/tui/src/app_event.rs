@@ -101,6 +101,11 @@ pub(crate) enum AppEvent {
         process_key: String,
     },
 
+    /// Open a full-screen details view for a completed command history entry.
+    OpenCommandHistoryDetails {
+        transcript_index: usize,
+    },
+
     /// Fork the current session into a new thread.
     ForkCurrentSession,
 

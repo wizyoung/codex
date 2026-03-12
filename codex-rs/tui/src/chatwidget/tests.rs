@@ -5161,7 +5161,9 @@ async fn unified_exec_wait_status_header_updates_on_late_command_display() {
         key: "proc-1".to_string(),
         call_id: "call-1".to_string(),
         command_display: "sleep 5".to_string(),
+        cwd: PathBuf::from("/tmp"),
         recent_chunks: Vec::new(),
+        output_lines: VecDeque::new(),
     });
 
     chat.on_terminal_interaction(TerminalInteractionEvent {
@@ -6096,6 +6098,19 @@ async fn slash_clean_submits_background_terminal_cleanup() {
     assert!(
         rendered.contains("Stopping all background terminals."),
         "expected cleanup confirmation, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn slash_ps_opens_background_terminals_panel() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.dispatch_command(SlashCommand::Ps);
+
+    assert!(chat.is_background_terminals_panel_open());
+    assert!(
+        rx.try_recv().is_err(),
+        "expected no app event for /ps panel open"
     );
 }
 
@@ -8758,23 +8773,15 @@ async fn review_ended_keeps_unified_exec_processes() {
 
     assert_eq!(chat.unified_exec_processes.len(), 2);
 
-    chat.add_ps_output();
-    let cells = drain_insert_history(&mut rx);
-    let combined = cells
-        .iter()
-        .map(|lines| lines_to_single_string(lines))
-        .collect::<Vec<_>>()
-        .join("\n");
+    chat.open_background_terminals_panel();
     assert!(
-        combined.contains("Background terminals"),
-        "expected /ps to remain available after review-ended abort; got {combined:?}"
+        chat.is_background_terminals_panel_open(),
+        "expected /ps-equivalent panel to remain available after review-ended abort"
     );
     assert!(
-        combined.contains("sleep 5") && combined.contains("sleep 6"),
-        "expected /ps to list running unified exec processes; got {combined:?}"
+        rx.try_recv().is_err(),
+        "expected no history output from /ps panel"
     );
-
-    let _ = drain_insert_history(&mut rx);
 }
 
 #[tokio::test]
@@ -8830,23 +8837,15 @@ async fn turn_complete_keeps_unified_exec_processes() {
 
     assert_eq!(chat.unified_exec_processes.len(), 2);
 
-    chat.add_ps_output();
-    let cells = drain_insert_history(&mut rx);
-    let combined = cells
-        .iter()
-        .map(|lines| lines_to_single_string(lines))
-        .collect::<Vec<_>>()
-        .join("\n");
+    chat.open_background_terminals_panel();
     assert!(
-        combined.contains("Background terminals"),
-        "expected /ps to remain available after turn complete; got {combined:?}"
+        chat.is_background_terminals_panel_open(),
+        "expected /ps-equivalent panel to remain available after turn complete"
     );
     assert!(
-        combined.contains("sleep 5") && combined.contains("sleep 6"),
-        "expected /ps to list running unified exec processes; got {combined:?}"
+        rx.try_recv().is_err(),
+        "expected no history output from /ps panel"
     );
-
-    let _ = drain_insert_history(&mut rx);
 }
 
 // Snapshot test: ChatWidget at very small heights (idle)

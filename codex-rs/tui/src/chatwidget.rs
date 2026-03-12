@@ -180,6 +180,9 @@ const PLAN_MODE_REASONING_SCOPE_TITLE: &str = "Apply reasoning change";
 const PLAN_MODE_REASONING_SCOPE_PLAN_ONLY: &str = "Apply to Plan mode override";
 const PLAN_MODE_REASONING_SCOPE_ALL_MODES: &str = "Apply to global default and Plan mode override";
 const CONNECTORS_SELECTION_VIEW_ID: &str = "connectors-selection";
+const BACKGROUND_TERMINALS_SELECTION_VIEW_ID: &str = "background-terminals-selection";
+const MAX_BACKGROUND_TERMINAL_PREVIEW_LINES: usize = 3;
+const MAX_BACKGROUND_TERMINAL_BUFFER_LINES: usize = 200;
 
 /// Choose the keybinding used to edit the most-recently queued message.
 ///
@@ -321,7 +324,9 @@ struct UnifiedExecProcessSummary {
     key: String,
     call_id: String,
     command_display: String,
+    cwd: PathBuf,
     recent_chunks: Vec<String>,
+    output_lines: VecDeque<String>,
 }
 
 struct UnifiedExecWaitState {
@@ -2435,16 +2440,21 @@ impl ChatWidget {
         {
             existing.call_id = ev.call_id.clone();
             existing.command_display = command_display;
+            existing.cwd = ev.cwd.clone();
             existing.recent_chunks.clear();
+            existing.output_lines.clear();
         } else {
             self.unified_exec_processes.push(UnifiedExecProcessSummary {
                 key,
                 call_id: ev.call_id.clone(),
                 command_display,
+                cwd: ev.cwd.clone(),
                 recent_chunks: Vec::new(),
+                output_lines: VecDeque::new(),
             });
         }
         self.sync_unified_exec_footer();
+        self.refresh_background_terminals_panel_if_open();
     }
 
     fn track_unified_exec_process_end(&mut self, ev: &ExecCommandEndEvent) {
@@ -2454,6 +2464,7 @@ impl ChatWidget {
             .retain(|process| process.key != key);
         if self.unified_exec_processes.len() != before {
             self.sync_unified_exec_footer();
+            self.refresh_background_terminals_panel_if_open();
         }
     }
 
@@ -2483,13 +2494,18 @@ impl ChatWidget {
             .filter(|line| !line.is_empty())
         {
             process.recent_chunks.push(line.to_string());
+            process.output_lines.push_back(line.to_string());
         }
 
-        const MAX_RECENT_CHUNKS: usize = 3;
-        if process.recent_chunks.len() > MAX_RECENT_CHUNKS {
-            let drop_count = process.recent_chunks.len() - MAX_RECENT_CHUNKS;
+        if process.recent_chunks.len() > MAX_BACKGROUND_TERMINAL_PREVIEW_LINES {
+            let drop_count = process.recent_chunks.len() - MAX_BACKGROUND_TERMINAL_PREVIEW_LINES;
             process.recent_chunks.drain(0..drop_count);
         }
+        if process.output_lines.len() > MAX_BACKGROUND_TERMINAL_BUFFER_LINES {
+            let drop_count = process.output_lines.len() - MAX_BACKGROUND_TERMINAL_BUFFER_LINES;
+            process.output_lines.drain(0..drop_count);
+        }
+        self.refresh_background_terminals_panel_if_open();
     }
 
     fn clear_unified_exec_processes(&mut self) {
@@ -2498,6 +2514,7 @@ impl ChatWidget {
         }
         self.unified_exec_processes.clear();
         self.sync_unified_exec_footer();
+        self.refresh_background_terminals_panel_if_open();
     }
 
     fn on_mcp_tool_call_begin(&mut self, ev: McpToolCallBeginEvent) {
@@ -3956,6 +3973,10 @@ impl ChatWidget {
         self.bottom_pane.no_modal_or_popup_active()
     }
 
+    pub(crate) fn can_toggle_background_terminals_panel(&self) -> bool {
+        self.no_modal_or_popup_active() || self.is_background_terminals_panel_open()
+    }
+
     pub(crate) fn can_launch_external_editor(&self) -> bool {
         self.bottom_pane.can_launch_external_editor()
     }
@@ -4237,7 +4258,7 @@ impl ChatWidget {
                 self.open_theme_picker();
             }
             SlashCommand::Ps => {
-                self.add_ps_output();
+                self.open_background_terminals_panel();
             }
             SlashCommand::Clean => {
                 self.clean_background_terminals();
@@ -5643,16 +5664,172 @@ impl ChatWidget {
         }
     }
 
-    pub(crate) fn add_ps_output(&mut self) {
-        let processes = self
+    pub(crate) fn open_background_terminals_panel(&mut self) {
+        let selected_key = self.selected_background_terminal_key();
+        let params = self.background_terminals_popup_params(selected_key.as_deref());
+        if !self
+            .bottom_pane
+            .replace_selection_view_if_active(BACKGROUND_TERMINALS_SELECTION_VIEW_ID, params)
+        {
+            self.bottom_pane.show_selection_view(
+                self.background_terminals_popup_params(selected_key.as_deref()),
+            );
+        }
+        self.request_redraw();
+    }
+
+    pub(crate) fn toggle_background_terminals_panel(&mut self) {
+        if self
+            .bottom_pane
+            .close_active_view_if(BACKGROUND_TERMINALS_SELECTION_VIEW_ID)
+        {
+            self.request_redraw();
+            return;
+        }
+        self.open_background_terminals_panel();
+    }
+
+    pub(crate) fn is_background_terminals_panel_open(&self) -> bool {
+        self.bottom_pane
+            .is_active_view(BACKGROUND_TERMINALS_SELECTION_VIEW_ID)
+    }
+
+    pub(crate) fn background_terminal_overlay_lines(
+        &self,
+        process_key: &str,
+    ) -> Vec<Line<'static>> {
+        let Some(process) = self
             .unified_exec_processes
             .iter()
-            .map(|process| history_cell::UnifiedExecProcessDetails {
-                command_display: process.command_display.clone(),
-                recent_chunks: process.recent_chunks.clone(),
-            })
+            .find(|process| process.key == process_key)
+        else {
+            return vec!["Background terminal already finished.".italic().into()];
+        };
+
+        let mut lines = vec![
+            Line::from(vec![
+                "Command: ".bold(),
+                process.command_display.clone().into(),
+            ]),
+            Line::from(vec![
+                "Working directory: ".bold(),
+                process.cwd.display().to_string().into(),
+            ]),
+            Line::from(vec!["Status: ".bold(), "running".yellow()]),
+            Line::from(""),
+            Line::from("Recent output".bold()),
+        ];
+
+        if process.output_lines.is_empty() {
+            lines.push("No output captured yet.".italic().into());
+        } else {
+            lines.extend(
+                process
+                    .output_lines
+                    .iter()
+                    .map(|line| Line::from(line.clone())),
+            );
+        }
+        lines
+    }
+
+    fn refresh_background_terminals_panel_if_open(&mut self) {
+        if !self.is_background_terminals_panel_open() {
+            return;
+        }
+        self.open_background_terminals_panel();
+    }
+
+    fn selected_background_terminal_key(&self) -> Option<String> {
+        let idx = self
+            .bottom_pane
+            .selected_index_for_active_view(BACKGROUND_TERMINALS_SELECTION_VIEW_ID)?;
+        self.unified_exec_processes.get(idx).map(|p| p.key.clone())
+    }
+
+    fn background_terminals_popup_params(&self, selected_key: Option<&str>) -> SelectionViewParams {
+        let mut header = ColumnRenderable::new();
+        header.push(Line::from("Background terminals".bold()));
+        header.push(Line::from(
+            "Inspect running background commands and their latest output.".dim(),
+        ));
+
+        if self.unified_exec_processes.is_empty() {
+            return SelectionViewParams {
+                view_id: Some(BACKGROUND_TERMINALS_SELECTION_VIEW_ID),
+                header: Box::new(header),
+                footer_hint: Some(self.background_terminals_hint_line()),
+                items: vec![SelectionItem {
+                    name: "No background terminals running".to_string(),
+                    description: Some(
+                        "Run a task that spawns a background terminal, then reopen this panel."
+                            .to_string(),
+                    ),
+                    is_disabled: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+        }
+
+        let initial_selected_idx = selected_key.and_then(|selected_key| {
+            self.unified_exec_processes
+                .iter()
+                .position(|process| process.key == selected_key)
+        });
+        let items = self
+            .unified_exec_processes
+            .iter()
+            .map(|process| self.background_terminal_selection_item(process))
             .collect();
-        self.add_to_history(history_cell::new_unified_exec_processes_output(processes));
+
+        SelectionViewParams {
+            view_id: Some(BACKGROUND_TERMINALS_SELECTION_VIEW_ID),
+            header: Box::new(header),
+            footer_hint: Some(self.background_terminals_hint_line()),
+            items,
+            initial_selected_idx,
+            col_width_mode: ColumnWidthMode::AutoAllRows,
+            ..Default::default()
+        }
+    }
+
+    fn background_terminal_selection_item(
+        &self,
+        process: &UnifiedExecProcessSummary,
+    ) -> SelectionItem {
+        let process_key = process.key.clone();
+        let cwd = process.cwd.display().to_string();
+        let preview = if process.recent_chunks.is_empty() {
+            "No output yet".to_string()
+        } else {
+            process.recent_chunks.join(" | ")
+        };
+        SelectionItem {
+            name: process.command_display.clone(),
+            description: Some(format!("running · {cwd}")),
+            selected_description: Some(format!(
+                "running · {cwd} · latest: {preview} · press Enter for full output"
+            )),
+            search_value: Some(format!("{} {}", process.command_display, cwd)),
+            actions: vec![Box::new(move |tx| {
+                tx.send(AppEvent::OpenBackgroundTerminalDetails {
+                    process_key: process_key.clone(),
+                });
+            })],
+            dismiss_on_select: false,
+            ..Default::default()
+        }
+    }
+
+    fn background_terminals_hint_line(&self) -> Line<'static> {
+        Line::from(vec![
+            "Press ".into(),
+            key_hint::plain(KeyCode::Enter).into(),
+            " for details, ".into(),
+            key_hint::plain(KeyCode::Esc).into(),
+            " to close.".into(),
+        ])
     }
 
     fn clean_background_terminals(&mut self) {

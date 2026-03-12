@@ -96,6 +96,11 @@ pub(crate) enum AppEvent {
     /// Open the resume picker inside the running TUI session.
     OpenResumePicker,
 
+    /// Open a full-screen details view for a running background terminal.
+    OpenBackgroundTerminalDetails {
+        process_key: String,
+    },
+
     /// Fork the current session into a new thread.
     ForkCurrentSession,
 

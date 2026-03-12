@@ -2240,6 +2240,17 @@ impl App {
                 // Leaving alt-screen may blank the inline viewport; force a redraw either way.
                 tui.frame_requester().schedule_frame();
             }
+            AppEvent::OpenBackgroundTerminalDetails { process_key } => {
+                let _ = tui.enter_alt_screen();
+                let lines = self
+                    .chat_widget
+                    .background_terminal_overlay_lines(&process_key);
+                self.overlay = Some(Overlay::new_static_with_lines(
+                    lines,
+                    "B A C K G R O U N D   T E R M I N A L".to_string(),
+                ));
+                tui.frame_requester().schedule_frame();
+            }
             AppEvent::ForkCurrentSession => {
                 self.session_telemetry.counter(
                     "codex.thread.fork",
@@ -3739,6 +3750,16 @@ impl App {
         }
 
         match key_event {
+            KeyEvent {
+                code: KeyCode::Char('p'),
+                modifiers: crossterm::event::KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                ..
+            } if self.overlay.is_none()
+                && self.chat_widget.can_toggle_background_terminals_panel() =>
+            {
+                self.chat_widget.toggle_background_terminals_panel();
+            }
             KeyEvent {
                 code: KeyCode::Char('t'),
                 modifiers: crossterm::event::KeyModifiers::CONTROL,

@@ -812,6 +812,22 @@ impl BottomPane {
             .and_then(|view| view.selected_index())
     }
 
+    pub(crate) fn is_active_view(&self, view_id: &'static str) -> bool {
+        self.view_stack
+            .last()
+            .is_some_and(|view| view.view_id() == Some(view_id))
+    }
+
+    pub(crate) fn close_active_view_if(&mut self, view_id: &'static str) -> bool {
+        if !self.is_active_view(view_id) {
+            return false;
+        }
+
+        self.view_stack.pop();
+        self.on_active_view_complete();
+        true
+    }
+
     /// Update the pending-input preview shown above the composer.
     pub(crate) fn set_pending_input_preview(
         &mut self,
@@ -1512,7 +1528,7 @@ mod tests {
 
         let area = Rect::new(0, 0, width, after);
         let rendered = render_snapshot(&pane, area);
-        assert!(rendered.contains("background terminal running · /ps to view"));
+        assert!(rendered.contains("background terminal running · Ctrl+P or /ps to view"));
     }
 
     #[test]

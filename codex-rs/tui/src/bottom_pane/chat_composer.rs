@@ -2886,11 +2886,6 @@ impl ChatComposer {
                 code: KeyCode::Up | KeyCode::Down,
                 kind: KeyEventKind::Press | KeyEventKind::Repeat,
                 ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('p') | KeyCode::Char('n'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
             } => {
                 if self
                     .history
@@ -2899,8 +2894,6 @@ impl ChatComposer {
                     let replace_entry = match key_event.code {
                         KeyCode::Up => self.history.navigate_up(&self.app_event_tx),
                         KeyCode::Down => self.history.navigate_down(&self.app_event_tx),
-                        KeyCode::Char('p') => self.history.navigate_up(&self.app_event_tx),
-                        KeyCode::Char('n') => self.history.navigate_down(&self.app_event_tx),
                         _ => unreachable!(),
                     };
                     if let Some(entry) = replace_entry {

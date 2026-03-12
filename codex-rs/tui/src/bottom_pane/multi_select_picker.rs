@@ -108,7 +108,7 @@ pub(crate) struct MultiSelectItem {
 ///
 /// The picker displays a scrollable list of items with checkboxes. Users can:
 /// - Type to fuzzy-search and filter the list
-/// - Use Up/Down (or Ctrl+P/Ctrl+N) to navigate
+/// - Use Up/Down to navigate
 /// - Press Space to toggle the selected item
 /// - Press Enter to confirm and close
 /// - Press Escape to cancel and close

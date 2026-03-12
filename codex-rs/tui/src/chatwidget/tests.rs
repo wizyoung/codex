@@ -5854,6 +5854,50 @@ async fn slash_copy_reports_when_no_copyable_output_exists() {
 }
 
 #[tokio::test]
+async fn paste_image_from_clipboard_attaches_local_image() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let path = PathBuf::from("/tmp/from-clipboard.png");
+
+    chat.paste_image_from_clipboard_with(|| {
+        Ok((
+            path.clone(),
+            crate::clipboard_paste::PastedImageInfo {
+                width: 640,
+                height: 480,
+                encoded_format: crate::clipboard_paste::EncodedImageFormat::Png,
+            },
+        ))
+    });
+
+    assert_eq!(
+        chat.bottom_pane.composer_local_images(),
+        vec![LocalImageAttachment {
+            placeholder: "[Image #1]".to_string(),
+            path,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn paste_image_from_clipboard_reports_errors() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.paste_image_from_clipboard_with(|| {
+        Err(crate::clipboard_paste::PasteImageError::NoImage(
+            "clipboard empty".to_string(),
+        ))
+    });
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one error message");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(
+        rendered.contains("Failed to paste image: no image on clipboard: clipboard empty"),
+        "expected clipboard error message, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
 async fn slash_copy_state_is_preserved_during_running_task() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
 

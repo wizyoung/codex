@@ -283,6 +283,12 @@ enum PromptSelectionAction {
     },
 }
 
+#[derive(Clone)]
+enum SlashPopupContext {
+    FirstLine(String),
+    InlinePasteImage { token_text: String },
+}
+
 /// Feature flags for reusing the chat composer in other bottom-pane surfaces.
 ///
 /// The default keeps today's behavior intact. Other call sites can opt out of
@@ -1360,10 +1366,7 @@ impl ChatComposer {
         } else {
             self.footer_mode = reset_mode_after_activity(self.footer_mode);
         }
-        let ActivePopup::Command(popup) = &mut self.active_popup else {
-            unreachable!();
-        };
-
+        let popup_context = self.slash_popup_context();
         match key_event {
             KeyEvent {
                 code: KeyCode::Up, ..
@@ -1373,6 +1376,9 @@ impl ChatComposer {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
+                let ActivePopup::Command(popup) = &mut self.active_popup else {
+                    unreachable!();
+                };
                 popup.move_up();
                 (InputResult::None, true)
             }
@@ -1385,6 +1391,9 @@ impl ChatComposer {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
+                let ActivePopup::Command(popup) = &mut self.active_popup else {
+                    unreachable!();
+                };
                 popup.move_down();
                 (InputResult::None, true)
             }
@@ -1401,11 +1410,34 @@ impl ChatComposer {
                 // Ensure popup filtering/selection reflects the latest composer text
                 // before applying completion.
                 let first_line = self.textarea.text().lines().next().unwrap_or("");
-                popup.on_composer_text_change(first_line.to_string());
-                if let Some(sel) = popup.selected_item() {
+                let popup_text = match popup_context.as_ref() {
+                    Some(SlashPopupContext::FirstLine(text)) => text.clone(),
+                    Some(SlashPopupContext::InlinePasteImage { token_text }) => token_text.clone(),
+                    None => first_line.to_string(),
+                };
+                let selected_item = {
+                    let ActivePopup::Command(popup) = &mut self.active_popup else {
+                        unreachable!();
+                    };
+                    popup.on_composer_text_change(popup_text);
+                    popup.selected_item()
+                };
+                if let Some(sel) = selected_item {
                     let mut cursor_target: Option<usize> = None;
                     match sel {
                         CommandItem::Builtin(cmd) => {
+                            if matches!(
+                                popup_context.as_ref(),
+                                Some(SlashPopupContext::InlinePasteImage { .. })
+                            ) && cmd == SlashCommand::PasteImage
+                            {
+                                if let Some((range, _)) = self.current_inline_paste_image_token() {
+                                    let cursor_target = range.start + "/paste-image".len();
+                                    self.textarea.replace_range(range, "/paste-image");
+                                    self.textarea.set_cursor(cursor_target);
+                                }
+                                return (InputResult::None, true);
+                            }
                             if cmd == SlashCommand::Skills {
                                 self.textarea.set_text_clearing_elements("");
                                 return (InputResult::Command(cmd), true);
@@ -1423,9 +1455,15 @@ impl ChatComposer {
                             }
                         }
                         CommandItem::UserPrompt(idx) => {
-                            if let Some(prompt) = popup.prompt(idx) {
+                            let prompt = {
+                                let ActivePopup::Command(popup) = &mut self.active_popup else {
+                                    unreachable!();
+                                };
+                                popup.prompt(idx).cloned()
+                            };
+                            if let Some(prompt) = prompt {
                                 match prompt_selection_action(
-                                    prompt,
+                                    &prompt,
                                     first_line,
                                     PromptSelectionMode::Completion,
                                     &self.textarea.text_elements(),
@@ -1485,16 +1523,38 @@ impl ChatComposer {
                     );
                 }
 
-                if let Some(sel) = popup.selected_item() {
+                let selected_item = {
+                    let ActivePopup::Command(popup) = &mut self.active_popup else {
+                        unreachable!();
+                    };
+                    popup.selected_item()
+                };
+                if let Some(sel) = selected_item {
                     match sel {
                         CommandItem::Builtin(cmd) => {
+                            if matches!(
+                                popup_context.as_ref(),
+                                Some(SlashPopupContext::InlinePasteImage { .. })
+                            ) && cmd == SlashCommand::PasteImage
+                            {
+                                if let Some((range, _)) = self.current_inline_paste_image_token() {
+                                    self.textarea.replace_range(range, "");
+                                }
+                                return (InputResult::Command(cmd), true);
+                            }
                             self.textarea.set_text_clearing_elements("");
                             return (InputResult::Command(cmd), true);
                         }
                         CommandItem::UserPrompt(idx) => {
-                            if let Some(prompt) = popup.prompt(idx) {
+                            let prompt = {
+                                let ActivePopup::Command(popup) = &mut self.active_popup else {
+                                    unreachable!();
+                                };
+                                popup.prompt(idx).cloned()
+                            };
+                            if let Some(prompt) = prompt {
                                 match prompt_selection_action(
-                                    prompt,
+                                    &prompt,
                                     first_line,
                                     PromptSelectionMode::Submit,
                                     &self.textarea.text_elements(),
@@ -1985,11 +2045,11 @@ impl ChatComposer {
     /// - If the token under the cursor starts with `prefix`, that token is
     ///   returned without the leading prefix. When `allow_empty` is true, a
     ///   lone prefix character yields `Some(String::new())` to surface hints.
-    fn current_prefixed_token(
+    fn current_prefixed_token_range(
         textarea: &TextArea,
         prefix: char,
         allow_empty: bool,
-    ) -> Option<String> {
+    ) -> Option<(Range<usize>, String)> {
         let cursor_offset = textarea.cursor();
         let text = textarea.text();
 
@@ -2034,7 +2094,7 @@ impl ChatComposer {
             .unwrap_or(after_cursor.len());
         let end_left = safe_cursor + end_left_rel;
         let token_left = if start_left < end_left {
-            Some(&text[start_left..end_left])
+            Some((start_left..end_left, &text[start_left..end_left]))
         } else {
             None
         };
@@ -2053,24 +2113,30 @@ impl ChatComposer {
             .unwrap_or(text.len() - start_right);
         let end_right = start_right + end_right_rel;
         let token_right = if start_right < end_right {
-            Some(&text[start_right..end_right])
+            Some((start_right..end_right, &text[start_right..end_right]))
         } else {
             None
         };
 
         let prefix_str = prefix.to_string();
-        let left_match = token_left.filter(|t| t.starts_with(prefix));
-        let right_match = token_right.filter(|t| t.starts_with(prefix));
+        let left_match = token_left
+            .as_ref()
+            .filter(|(_, token)| token.starts_with(prefix));
+        let right_match = token_right
+            .as_ref()
+            .filter(|(_, token)| token.starts_with(prefix));
 
-        let left_prefixed = left_match.map(|t| t[prefix.len_utf8()..].to_string());
-        let right_prefixed = right_match.map(|t| t[prefix.len_utf8()..].to_string());
+        let left_prefixed = left_match
+            .map(|(range, token)| (range.clone(), token[prefix.len_utf8()..].to_string()));
+        let right_prefixed = right_match
+            .map(|(range, token)| (range.clone(), token[prefix.len_utf8()..].to_string()));
 
         if at_whitespace {
             if right_prefixed.is_some() {
                 return right_prefixed;
             }
-            if token_left.is_some_and(|t| t == prefix_str) {
-                return allow_empty.then(String::new);
+            if token_left.is_some_and(|(_, token)| token == prefix_str) {
+                return allow_empty.then(|| (start_left..end_left, String::new()));
             }
             return left_prefixed;
         }
@@ -2088,6 +2154,14 @@ impl ChatComposer {
         left_prefixed.or(right_prefixed)
     }
 
+    fn current_prefixed_token(
+        textarea: &TextArea,
+        prefix: char,
+        allow_empty: bool,
+    ) -> Option<String> {
+        Self::current_prefixed_token_range(textarea, prefix, allow_empty).map(|(_, token)| token)
+    }
+
     /// Extract the `@token` that the cursor is currently positioned on, if any.
     ///
     /// The returned string **does not** include the leading `@`.
@@ -2100,6 +2174,49 @@ impl ChatComposer {
             return None;
         }
         Self::current_prefixed_token(&self.textarea, '$', true)
+    }
+
+    fn current_inline_paste_image_token(&self) -> Option<(Range<usize>, String)> {
+        if !self.slash_commands_enabled() {
+            return None;
+        }
+
+        let (range, token) = Self::current_prefixed_token_range(&self.textarea, '/', true)?;
+        if range.start == 0
+            || !SlashCommand::PasteImage
+                .command()
+                .starts_with(token.as_str())
+        {
+            return None;
+        }
+
+        Some((range, token))
+    }
+
+    fn slash_popup_context(&self) -> Option<SlashPopupContext> {
+        let text = self.textarea.text();
+        let first_line_end = text.find('\n').unwrap_or(text.len());
+        let first_line = &text[..first_line_end];
+        let cursor = self.textarea.cursor();
+        let caret_on_first_line = cursor <= first_line_end;
+
+        if caret_on_first_line
+            && Self::slash_command_under_cursor(first_line, cursor)
+                .is_some_and(|(name, rest)| self.looks_like_slash_prefix(name, rest))
+        {
+            return Some(SlashPopupContext::FirstLine(first_line.to_string()));
+        }
+
+        if caret_on_first_line
+            && let Some((_, token)) = self.current_inline_paste_image_token()
+            && token != SlashCommand::PasteImage.command()
+        {
+            return Some(SlashPopupContext::InlinePasteImage {
+                token_text: format!("/{token}"),
+            });
+        }
+
+        None
     }
 
     /// Replace the active `@token` (the one under the cursor) with `path`.
@@ -2435,6 +2552,9 @@ impl ChatComposer {
         if let Some(result) = self.try_dispatch_bare_slash_command() {
             return (result, true);
         }
+        if let Some(result) = self.try_dispatch_inline_paste_image_command() {
+            return (result, true);
+        }
 
         // If we're in a paste-like burst capture, treat Enter/Ctrl+Shift+Q as part of the burst
         // and accumulate it rather than submitting or inserting immediately.
@@ -2533,6 +2653,18 @@ impl ChatComposer {
         } else {
             None
         }
+    }
+
+    fn try_dispatch_inline_paste_image_command(&mut self) -> Option<InputResult> {
+        let (range, token) = self.current_inline_paste_image_token()?;
+        if token != SlashCommand::PasteImage.command() {
+            return None;
+        }
+        if self.reject_slash_command_if_unavailable(SlashCommand::PasteImage) {
+            return Some(InputResult::None);
+        }
+        self.textarea.replace_range(range, "");
+        Some(InputResult::Command(SlashCommand::PasteImage))
     }
 
     /// Check if the input is a slash command with args (e.g., /review args) and dispatch it.
@@ -3438,17 +3570,6 @@ impl ChatComposer {
             }
             return;
         }
-        // Determine whether the caret is inside the initial '/name' token on the first line.
-        let text = self.textarea.text();
-        let first_line_end = text.find('\n').unwrap_or(text.len());
-        let first_line = &text[..first_line_end];
-        let cursor = self.textarea.cursor();
-        let caret_on_first_line = cursor <= first_line_end;
-
-        let is_editing_slash_command_name = caret_on_first_line
-            && Self::slash_command_under_cursor(first_line, cursor)
-                .is_some_and(|(name, rest)| self.looks_like_slash_prefix(name, rest));
-
         // If the cursor is currently positioned within an `@token`, prefer the
         // file-search popup over the slash popup so users can insert a file path
         // as an argument to the command (e.g., "/review @docs/...").
@@ -3458,16 +3579,26 @@ impl ChatComposer {
             }
             return;
         }
+        let popup_context = self.slash_popup_context();
         match &mut self.active_popup {
             ActivePopup::Command(popup) => {
-                if is_editing_slash_command_name {
-                    popup.on_composer_text_change(first_line.to_string());
+                if let Some(context) = popup_context.as_ref() {
+                    match context {
+                        SlashPopupContext::FirstLine(text) => {
+                            popup.set_builtin_restriction(None);
+                            popup.on_composer_text_change(text.clone());
+                        }
+                        SlashPopupContext::InlinePasteImage { token_text } => {
+                            popup.set_builtin_restriction(Some(SlashCommand::PasteImage));
+                            popup.on_composer_text_change(token_text.clone());
+                        }
+                    }
                 } else {
                     self.active_popup = ActivePopup::None;
                 }
             }
             _ => {
-                if is_editing_slash_command_name {
+                if let Some(context) = popup_context {
                     let collaboration_modes_enabled = self.collaboration_modes_enabled;
                     let connectors_enabled = self.connectors_enabled;
                     let fast_command_enabled = self.fast_command_enabled;
@@ -3486,7 +3617,15 @@ impl ChatComposer {
                             windows_degraded_sandbox_active: self.windows_degraded_sandbox_active,
                         },
                     );
-                    command_popup.on_composer_text_change(first_line.to_string());
+                    match context {
+                        SlashPopupContext::FirstLine(text) => {
+                            command_popup.on_composer_text_change(text);
+                        }
+                        SlashPopupContext::InlinePasteImage { token_text } => {
+                            command_popup.set_builtin_restriction(Some(SlashCommand::PasteImage));
+                            command_popup.on_composer_text_change(token_text);
+                        }
+                    }
                     self.active_popup = ActivePopup::Command(command_popup);
                 }
             }
@@ -9421,6 +9560,95 @@ mod tests {
             matches!(composer.active_popup, ActivePopup::None),
             "'/zzz' should not activate slash popup because it is not a prefix of any built-in command"
         );
+    }
+
+    #[test]
+    fn inline_paste_image_popup_activates_but_other_inline_commands_do_not() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        composer.set_text_content("hello /p".to_string(), Vec::new(), Vec::new());
+        composer.textarea.set_cursor(composer.textarea.text().len());
+        composer.sync_popups();
+        assert!(
+            matches!(composer.active_popup, ActivePopup::Command(_)),
+            "inline '/p' should activate the paste-image popup"
+        );
+
+        composer.set_text_content("hello /diff".to_string(), Vec::new(), Vec::new());
+        composer.textarea.set_cursor(composer.textarea.text().len());
+        composer.sync_popups();
+        assert!(
+            matches!(composer.active_popup, ActivePopup::None),
+            "inline '/diff' should not activate the general slash popup"
+        );
+
+        composer.set_text_content("hello /paste-image".to_string(), Vec::new(), Vec::new());
+        composer.textarea.set_cursor(composer.textarea.text().len());
+        composer.sync_popups();
+        assert!(
+            matches!(composer.active_popup, ActivePopup::None),
+            "exact inline '/paste-image' should not keep the popup open"
+        );
+    }
+
+    #[test]
+    fn inline_paste_image_dispatch_preserves_existing_text() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        composer.set_text_content("hello /paste-image".to_string(), Vec::new(), Vec::new());
+        composer.textarea.set_cursor(composer.textarea.text().len());
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(result, InputResult::Command(SlashCommand::PasteImage));
+        assert_eq!(composer.textarea.text(), "hello ");
+    }
+
+    #[test]
+    fn inline_paste_image_tab_completion_replaces_only_current_token() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        composer.set_text_content("hello /pa".to_string(), Vec::new(), Vec::new());
+        composer.textarea.set_cursor(composer.textarea.text().len());
+        composer.sync_popups();
+
+        let (_result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert_eq!(composer.textarea.text(), "hello /paste-image");
     }
 
     #[test]

@@ -235,7 +235,7 @@ use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::custom_prompt_view::CustomPromptView;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
-use crate::clipboard_paste::paste_image_to_temp_png;
+use crate::clipboard_paste::paste_images_to_temp_png;
 use crate::clipboard_text;
 use crate::collaboration_modes;
 use crate::diff_render::display_path_for;
@@ -3887,25 +3887,35 @@ impl ChatWidget {
     }
 
     fn paste_image_from_clipboard(&mut self) {
-        self.paste_image_from_clipboard_with(paste_image_to_temp_png);
+        self.paste_image_from_clipboard_with(paste_images_to_temp_png);
     }
 
     fn paste_image_from_clipboard_with<F>(&mut self, reader: F)
     where
         F: FnOnce() -> Result<
-            (PathBuf, crate::clipboard_paste::PastedImageInfo),
+            Vec<(PathBuf, crate::clipboard_paste::PastedImageInfo)>,
             crate::clipboard_paste::PasteImageError,
         >,
     {
         match reader() {
-            Ok((path, info)) => {
-                tracing::debug!(
-                    "pasted image size={}x{} format={}",
-                    info.width,
-                    info.height,
-                    info.encoded_format.label()
-                );
-                self.attach_image(path);
+            Ok(images) => {
+                if !self.current_model_supports_images() {
+                    if let Some((path, _)) = images.into_iter().next() {
+                        self.attach_image(path);
+                    }
+                    return;
+                }
+
+                for (path, info) in images {
+                    tracing::debug!(
+                        "pasted image size={}x{} format={}",
+                        info.width,
+                        info.height,
+                        info.encoded_format.label()
+                    );
+                    self.attach_image(path);
+                }
+                self.insert_str(" ");
             }
             Err(err) => {
                 tracing::warn!("failed to paste image: {err}");

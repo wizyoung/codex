@@ -31,6 +31,7 @@ pub(crate) struct CommandPopup {
     command_filter: String,
     builtins: Vec<(&'static str, SlashCommand)>,
     prompts: Vec<CustomPrompt>,
+    builtin_restriction: Option<SlashCommand>,
     state: ScrollState,
 }
 
@@ -75,6 +76,7 @@ impl CommandPopup {
             command_filter: String::new(),
             builtins,
             prompts,
+            builtin_restriction: None,
             state: ScrollState::new(),
         }
     }
@@ -92,6 +94,14 @@ impl CommandPopup {
 
     pub(crate) fn prompt(&self, idx: usize) -> Option<&CustomPrompt> {
         self.prompts.get(idx)
+    }
+
+    pub(crate) fn set_builtin_restriction(&mut self, restriction: Option<SlashCommand>) {
+        self.builtin_restriction = restriction;
+        let matches_len = self.filtered_items().len();
+        self.state.clamp_selection(matches_len);
+        self.state
+            .ensure_visible(matches_len, MAX_POPUP_ROWS.min(matches_len));
     }
 
     /// Update the filter string based on the current composer text. The text
@@ -143,10 +153,19 @@ impl CommandPopup {
         if filter.is_empty() {
             // Built-ins first, in presentation order.
             for (_, cmd) in self.builtins.iter() {
+                if self
+                    .builtin_restriction
+                    .is_some_and(|restriction| restriction != *cmd)
+                {
+                    continue;
+                }
                 if ALIAS_COMMANDS.contains(cmd) {
                     continue;
                 }
                 out.push((CommandItem::Builtin(*cmd), None));
+            }
+            if self.builtin_restriction.is_some() {
+                return out;
             }
             // Then prompts, already sorted by name.
             for idx in 0..self.prompts.len() {
@@ -184,7 +203,18 @@ impl CommandPopup {
             };
 
         for (_, cmd) in self.builtins.iter() {
+            if self
+                .builtin_restriction
+                .is_some_and(|restriction| restriction != *cmd)
+            {
+                continue;
+            }
             push_match(CommandItem::Builtin(*cmd), cmd.command(), None, 0);
+        }
+        if self.builtin_restriction.is_some() {
+            out.extend(exact);
+            out.extend(prefix);
+            return out;
         }
         // Support both search styles:
         // - Typing "name" should surface "/prompts:name" results.

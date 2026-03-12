@@ -5859,14 +5859,14 @@ async fn paste_image_from_clipboard_attaches_local_image() {
     let path = PathBuf::from("/tmp/from-clipboard.png");
 
     chat.paste_image_from_clipboard_with(|| {
-        Ok((
+        Ok(vec![(
             path.clone(),
             crate::clipboard_paste::PastedImageInfo {
                 width: 640,
                 height: 480,
                 encoded_format: crate::clipboard_paste::EncodedImageFormat::Png,
             },
-        ))
+        )])
     });
 
     assert_eq!(
@@ -5876,6 +5876,50 @@ async fn paste_image_from_clipboard_attaches_local_image() {
             path,
         }]
     );
+    assert_eq!(chat.composer_text_with_pending(), "[Image #1] ");
+}
+
+#[tokio::test]
+async fn paste_image_from_clipboard_attaches_multiple_local_images() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let first = PathBuf::from("/tmp/from-clipboard-1.png");
+    let second = PathBuf::from("/tmp/from-clipboard-2.png");
+
+    chat.paste_image_from_clipboard_with(|| {
+        Ok(vec![
+            (
+                first.clone(),
+                crate::clipboard_paste::PastedImageInfo {
+                    width: 640,
+                    height: 480,
+                    encoded_format: crate::clipboard_paste::EncodedImageFormat::Png,
+                },
+            ),
+            (
+                second.clone(),
+                crate::clipboard_paste::PastedImageInfo {
+                    width: 320,
+                    height: 200,
+                    encoded_format: crate::clipboard_paste::EncodedImageFormat::Png,
+                },
+            ),
+        ])
+    });
+
+    assert_eq!(
+        chat.bottom_pane.composer_local_images(),
+        vec![
+            LocalImageAttachment {
+                placeholder: "[Image #1]".to_string(),
+                path: first,
+            },
+            LocalImageAttachment {
+                placeholder: "[Image #2]".to_string(),
+                path: second,
+            },
+        ]
+    );
+    assert_eq!(chat.composer_text_with_pending(), "[Image #1][Image #2] ");
 }
 
 #[tokio::test]

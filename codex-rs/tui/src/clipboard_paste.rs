@@ -48,7 +48,7 @@ pub struct PastedImageInfo {
 
 /// Capture image from system clipboard, encode to PNG, and return bytes + info.
 #[cfg(not(target_os = "android"))]
-pub fn paste_image_as_png() -> Result<(Vec<u8>, PastedImageInfo), PasteImageError> {
+pub fn paste_images_as_png() -> Result<Vec<(Vec<u8>, PastedImageInfo)>, PasteImageError> {
     let _span = tracing::debug_span!("paste_image_as_png").entered();
     tracing::debug!("attempting clipboard image read");
     let mut cb = arboard::Clipboard::new()
@@ -60,18 +60,12 @@ pub fn paste_image_as_png() -> Result<(Vec<u8>, PastedImageInfo), PasteImageErro
         .get()
         .file_list()
         .map_err(|e| PasteImageError::ClipboardUnavailable(e.to_string()));
-    let dyn_img = if let Some(img) = files
-        .unwrap_or_default()
-        .into_iter()
-        .find_map(|f| image::open(f).ok())
-    {
-        tracing::debug!(
-            "clipboard image opened from file: {}x{}",
-            img.width(),
-            img.height()
-        );
-        img
-    } else {
+    let file_images = encode_clipboard_file_images(files.unwrap_or_default());
+    if !file_images.is_empty() {
+        return Ok(file_images);
+    }
+
+    let dyn_img = {
         let _span = tracing::debug_span!("get_image").entered();
         let img = cb
             .get_image()
@@ -87,30 +81,12 @@ pub fn paste_image_as_png() -> Result<(Vec<u8>, PastedImageInfo), PasteImageErro
         image::DynamicImage::ImageRgba8(rgba_img)
     };
 
-    let mut png: Vec<u8> = Vec::new();
-    {
-        let span =
-            tracing::debug_span!("encode_image", byte_length = tracing::field::Empty).entered();
-        let mut cursor = std::io::Cursor::new(&mut png);
-        dyn_img
-            .write_to(&mut cursor, image::ImageFormat::Png)
-            .map_err(|e| PasteImageError::EncodeFailed(e.to_string()))?;
-        span.record("byte_length", png.len());
-    }
-
-    Ok((
-        png,
-        PastedImageInfo {
-            width: dyn_img.width(),
-            height: dyn_img.height(),
-            encoded_format: EncodedImageFormat::Png,
-        },
-    ))
+    Ok(vec![encode_image_as_png(&dyn_img)?])
 }
 
 /// Android/Termux does not support arboard; return a clear error.
 #[cfg(target_os = "android")]
-pub fn paste_image_as_png() -> Result<(Vec<u8>, PastedImageInfo), PasteImageError> {
+pub fn paste_images_as_png() -> Result<Vec<(Vec<u8>, PastedImageInfo)>, PasteImageError> {
     Err(PasteImageError::ClipboardUnavailable(
         "clipboard image paste is unsupported on Android".into(),
     ))
@@ -118,28 +94,19 @@ pub fn paste_image_as_png() -> Result<(Vec<u8>, PastedImageInfo), PasteImageErro
 
 /// Convenience: write to a temp file and return its path + info.
 #[cfg(not(target_os = "android"))]
-pub fn paste_image_to_temp_png() -> Result<(PathBuf, PastedImageInfo), PasteImageError> {
+pub fn paste_images_to_temp_png() -> Result<Vec<(PathBuf, PastedImageInfo)>, PasteImageError> {
     // First attempt: read image from system clipboard via arboard (native paths or image data).
-    match paste_image_as_png() {
-        Ok((png, info)) => {
-            // Create a unique temporary file with a .png suffix to avoid collisions.
-            let tmp = Builder::new()
-                .prefix("codex-clipboard-")
-                .suffix(".png")
-                .tempfile()
-                .map_err(|e| PasteImageError::IoError(e.to_string()))?;
-            std::fs::write(tmp.path(), &png)
-                .map_err(|e| PasteImageError::IoError(e.to_string()))?;
-            // Persist the file (so it remains after the handle is dropped) and return its PathBuf.
-            let (_file, path) = tmp
-                .keep()
-                .map_err(|e| PasteImageError::IoError(e.error.to_string()))?;
-            Ok((path, info))
-        }
+    match paste_images_as_png() {
+        Ok(images) => images
+            .into_iter()
+            .map(|(png, info)| write_image_to_temp_png(&png).map(|path| (path, info)))
+            .collect(),
         Err(e) => {
             #[cfg(target_os = "linux")]
             {
-                try_wsl_clipboard_fallback(&e).or(Err(e))
+                try_wsl_clipboard_fallback(&e)
+                    .map(|image| vec![image])
+                    .or(Err(e))
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -229,11 +196,73 @@ fn try_dump_windows_clipboard_image() -> Option<String> {
 }
 
 #[cfg(target_os = "android")]
-pub fn paste_image_to_temp_png() -> Result<(PathBuf, PastedImageInfo), PasteImageError> {
-    // Keep error consistent with paste_image_as_png.
+pub fn paste_images_to_temp_png() -> Result<Vec<(PathBuf, PastedImageInfo)>, PasteImageError> {
+    // Keep error consistent with paste_images_as_png.
     Err(PasteImageError::ClipboardUnavailable(
         "clipboard image paste is unsupported on Android".into(),
     ))
+}
+
+#[cfg(not(target_os = "android"))]
+fn encode_image_as_png(
+    dyn_img: &image::DynamicImage,
+) -> Result<(Vec<u8>, PastedImageInfo), PasteImageError> {
+    let mut png: Vec<u8> = Vec::new();
+    {
+        let span =
+            tracing::debug_span!("encode_image", byte_length = tracing::field::Empty).entered();
+        let mut cursor = std::io::Cursor::new(&mut png);
+        dyn_img
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .map_err(|e| PasteImageError::EncodeFailed(e.to_string()))?;
+        span.record("byte_length", png.len());
+    }
+
+    Ok((
+        png,
+        PastedImageInfo {
+            width: dyn_img.width(),
+            height: dyn_img.height(),
+            encoded_format: EncodedImageFormat::Png,
+        },
+    ))
+}
+
+#[cfg(not(target_os = "android"))]
+fn encode_clipboard_file_images(paths: Vec<PathBuf>) -> Vec<(Vec<u8>, PastedImageInfo)> {
+    let mut images = Vec::new();
+
+    for path in paths {
+        let Ok(image) = image::open(&path) else {
+            tracing::debug!("failed to open clipboard image file: {path:?}");
+            continue;
+        };
+        tracing::debug!(
+            "clipboard image opened from file: {}x{}",
+            image.width(),
+            image.height()
+        );
+        match encode_image_as_png(&image) {
+            Ok(encoded) => images.push(encoded),
+            Err(err) => tracing::warn!("failed to encode clipboard image file {path:?}: {err}"),
+        }
+    }
+
+    images
+}
+
+#[cfg(not(target_os = "android"))]
+fn write_image_to_temp_png(png: &[u8]) -> Result<PathBuf, PasteImageError> {
+    let tmp = Builder::new()
+        .prefix("codex-clipboard-")
+        .suffix(".png")
+        .tempfile()
+        .map_err(|e| PasteImageError::IoError(e.to_string()))?;
+    std::fs::write(tmp.path(), png).map_err(|e| PasteImageError::IoError(e.to_string()))?;
+    let (_file, path) = tmp
+        .keep()
+        .map_err(|e| PasteImageError::IoError(e.error.to_string()))?;
+    Ok(path)
 }
 
 /// Normalize pasted text that may represent a filesystem path.
@@ -545,5 +574,43 @@ mod pasted_paths_tests {
             result,
             PathBuf::from("/mnt/c/Users/Alice/Pictures/example image.png")
         );
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn encode_clipboard_file_images_keeps_all_valid_images() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let first_path = temp_dir.path().join("first.png");
+        let second_path = temp_dir.path().join("second.png");
+
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]))
+            .save(&first_path)
+            .expect("write first image");
+        image::RgbaImage::from_pixel(2, 1, image::Rgba([0, 255, 0, 255]))
+            .save(&second_path)
+            .expect("write second image");
+
+        let images = encode_clipboard_file_images(vec![first_path, second_path]);
+
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].1.width, 1);
+        assert_eq!(images[1].1.width, 2);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn encode_clipboard_file_images_skips_invalid_paths() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let valid_path = temp_dir.path().join("valid.png");
+        let invalid_path = temp_dir.path().join("missing.png");
+
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 255, 255]))
+            .save(&valid_path)
+            .expect("write valid image");
+
+        let images = encode_clipboard_file_images(vec![invalid_path, valid_path]);
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].1.width, 1);
     }
 }

@@ -2249,10 +2249,7 @@ impl App {
                 let lines = self
                     .chat_widget
                     .background_terminal_overlay_lines(&process_key);
-                self.overlay = Some(Overlay::new_static_with_lines(
-                    lines,
-                    "B A C K G R O U N D   T E R M I N A L".to_string(),
-                ));
+                self.overlay = Some(Overlay::new_background_terminal_detail(process_key, lines));
                 tui.frame_requester().schedule_frame();
             }
             AppEvent::OpenCommandHistoryDetails { transcript_index } => {

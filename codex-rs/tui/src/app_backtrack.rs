@@ -389,6 +389,22 @@ impl App {
             }
             return Ok(());
         }
+        if let TuiEvent::Draw = &event
+            && let Some(Overlay::BackgroundTerminalDetail(o)) = &mut self.overlay
+        {
+            let lines = self
+                .chat_widget
+                .background_terminal_overlay_lines(o.process_key());
+            tui.draw(u16::MAX, |frame| {
+                o.sync_lines(lines);
+                o.render(frame.area(), frame.buffer);
+            })?;
+            if o.is_done() {
+                self.close_transcript_overlay(tui);
+                tui.frame_requester().schedule_frame();
+            }
+            return Ok(());
+        }
 
         if let Some(overlay) = &mut self.overlay {
             overlay.handle_event(tui, event)?;
